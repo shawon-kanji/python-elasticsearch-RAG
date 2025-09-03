@@ -1,12 +1,14 @@
 import uuid
 from elasticsearch.helpers import async_bulk
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from elasticsearch import AsyncElasticsearch
 from dotenv import load_dotenv
 import os
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
+from langchain_anthropic import ChatAnthropic
+from langchain.prompts import ChatPromptTemplate
 
 # Load environment variables
 load_dotenv()
@@ -18,6 +20,12 @@ es_client = AsyncElasticsearch(
 )
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # embedding mode
+# Anthropic LLM via LangChain
+llm = ChatAnthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    model="claude-3-5-sonnet-20240620",
+    temperature=0
+)
 
 
 @asynccontextmanager
@@ -95,6 +103,94 @@ async def ingest_data():
     except Exception as e:
         return {
             "status": "ingestion failed",
+            "error": str(e)
+        }
+
+
+@app.get("/es/search")
+async def search_context(query: str, k: int = 3):
+    try:
+        # Step 1: Load embedder
+        embedder = SentenceTransformer(MODEL_NAME)
+        query_vector = embedder.encode(query).tolist()
+
+        # Step 2: Run kNN vector search in ES
+        response = await es_client.search(
+            index="rag_documents",
+            knn={
+                "field": "embeddings",        # must match your mapping field
+                "query_vector": query_vector,
+                "num_candidates": 100         # more candidates → better recall
+            },
+            source=["content", "source"]     # only return relevant fields
+        )
+
+        print("context::: ", response)
+
+        # Step 3: Extract hits
+        contexts = [
+            {
+                "score": hit["_score"],
+                "content": hit["_source"]["content"],
+                "source": hit["_source"]["source"]
+            }
+            for hit in response["hits"]["hits"]
+        ]
+
+        return {
+            "status": "success",
+            "query": query,
+            "results": contexts
+        }
+
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str(e)
+        }
+
+
+@app.get("/rag/query")
+async def rag_query(query: str = Query(...), k: int = 5):
+    try:
+        embedder = SentenceTransformer(MODEL_NAME)
+        query_vector = embedder.encode(query).tolist()
+        response = await es_client.search(
+            index="rag_documents",
+            knn={
+                "field": "embeddings",
+                "query_vector": query_vector,
+                "num_candidates": 100
+            },
+            source=["content", "source"]
+        )
+        contexts = [
+            {
+                "score": hit["_score"],
+                "content": hit["_source"]["content"],
+                "source": hit["_source"]["source"]
+            }
+            for hit in response["hits"]["hits"][:k]
+        ]
+
+        # Prepare the prompt with retrieved contexts
+        context_text = "\n\n".join([c["content"] for c in contexts])
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful AI assistant for internal documents. Use ONLY the provided context to answer. Do not add anything beyond the context."),
+            ("human",
+             "Question: {question}\n\nContext:\n{context}\n\nAnswer in detail:")
+        ])
+
+        chain = prompt | llm
+        result = chain.invoke({"question": query, "context": context_text})
+        return {
+            "status": "success",
+            "query": query,
+            "answer": result,
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
             "error": str(e)
         }
 
