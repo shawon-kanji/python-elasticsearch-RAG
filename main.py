@@ -7,8 +7,11 @@ from dotenv import load_dotenv
 import os
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
+
 from langchain_anthropic import ChatAnthropic
 from langchain.prompts import ChatPromptTemplate
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import BaseMessage, HumanMessage, AIMessage
 
 # Load environment variables
 load_dotenv()
@@ -19,13 +22,22 @@ es_client = AsyncElasticsearch(
     api_key=os.getenv("ELASTICSEARCH_API_KEY")
 )
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # embedding mode
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # embedding model
 # Anthropic LLM via LangChain
 llm = ChatAnthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
     model="claude-3-5-sonnet-20240620",
     temperature=0
 )
+
+# Initialize embedding model globally
+embedder = SentenceTransformer(MODEL_NAME)
+
+
+def embed_func(texts):
+    if isinstance(texts, str):
+        return embedder.encode(texts).tolist()
+    return [embedder.encode(t).tolist() for t in texts]
 
 
 @asynccontextmanager
@@ -37,6 +49,9 @@ async def lifespan(app: FastAPI):
 
 # Initialize FastAPI with lifespan
 app = FastAPI(lifespan=lifespan)
+
+# Store conversation memories in-memory (you could also store in ES)
+conversation_memories = {}
 
 
 @app.get("/es/health")
@@ -71,10 +86,7 @@ async def ingest_data():
         )
         chunks = text_splitter.split_text(text)
 
-        # Step 3: Load embedding model
-        embedder = SentenceTransformer(MODEL_NAME)
-
-        # Step 4: Prepare bulk actions
+        # Step 3: Prepare bulk actions
         async def gen_actions():
             for i, chunk in enumerate(chunks):
                 embedding = embedder.encode(chunk).tolist()
@@ -86,11 +98,11 @@ async def ingest_data():
                         "id": i,
                         "content": chunk,
                         "source": "story1.md",
-                        "embeddings": embedding
+                        "embeddings": embedding  # Fixed: keep as "embeddings"
                     }
                 }
 
-        # Step 5: Run bulk indexing
+        # Step 4: Run bulk indexing
         success, failed = await async_bulk(es_client, gen_actions())
         await es_client.indices.refresh(index="rag_documents")
 
@@ -108,10 +120,9 @@ async def ingest_data():
 
 
 @app.get("/es/search")
-async def search_context(query: str, k: int = 3):
+async def search_context(query: str, k: int = 8):
     try:
-        # Step 1: Load embedder
-        embedder = SentenceTransformer(MODEL_NAME)
+        # Step 1: Get query embedding
         query_vector = embedder.encode(query).tolist()
 
         # Step 2: Run kNN vector search in ES
@@ -120,7 +131,8 @@ async def search_context(query: str, k: int = 3):
             knn={
                 "field": "embeddings",        # must match your mapping field
                 "query_vector": query_vector,
-                "num_candidates": 100         # more candidates → better recall
+                "k": k,                       # Fixed: use k instead of num_candidates
+                "num_candidates": k * 10      # more candidates → better recall
             },
             source=["content", "source"]     # only return relevant fields
         )
@@ -150,49 +162,103 @@ async def search_context(query: str, k: int = 3):
         }
 
 
+# ---------- Conversational RAG ----------
 @app.get("/rag/query")
-async def rag_query(query: str = Query(...), k: int = 5):
+async def rag_query(query: str, k: int = 5, thread_id: str = None):
+    """
+    Conversational RAG with in-memory conversation history:
+    - Retrieves relevant story context from ES
+    - Stores chat history in memory
+    """
     try:
-        embedder = SentenceTransformer(MODEL_NAME)
+        # Step 1: If new conversation, create a new thread
+        if thread_id is None:
+            thread_id = str(uuid.uuid4())
+
+        # Step 2: Get or create memory for this thread
+        if thread_id not in conversation_memories:
+            conversation_memories[thread_id] = ConversationBufferMemory(
+                memory_key="chat_history",
+                return_messages=True
+            )
+
+        memory = conversation_memories[thread_id]
+
+        # Step 3: Embed query and search in story index
         query_vector = embedder.encode(query).tolist()
         response = await es_client.search(
             index="rag_documents",
             knn={
-                "field": "embeddings",
+                "field": "embeddings",        # Fixed: match the field name from ingestion
                 "query_vector": query_vector,
-                "num_candidates": 100
+                "k": k,
+                "num_candidates": k * 10
             },
             source=["content", "source"]
         )
-        contexts = [
-            {
-                "score": hit["_score"],
-                "content": hit["_source"]["content"],
-                "source": hit["_source"]["source"]
-            }
-            for hit in response["hits"]["hits"][:k]
-        ]
+        contexts = [hit["_source"]["content"]
+                    for hit in response["hits"]["hits"]]
 
-        # Prepare the prompt with retrieved contexts
-        context_text = "\n\n".join([c["content"] for c in contexts])
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful AI assistant for internal documents. Use ONLY the provided context to answer. Do not add anything beyond the context."),
-            ("human",
-             "Question: {question}\n\nContext:\n{context}\n\nAnswer in detail:")
-        ])
+        # Step 4: Get chat history
+        chat_history = memory.chat_memory.messages
+        history_text = ""
+        if chat_history:
+            history_text = "\n".join([
+                f"Human: {msg.content}" if isinstance(msg, HumanMessage)
+                else f"Assistant: {msg.content}"
+                for msg in chat_history[-6:]  # Last 3 exchanges
+            ])
 
-        chain = prompt | llm
-        result = chain.invoke({"question": query, "context": context_text})
+        # Step 5: Create prompt template
+        prompt_template = """You are a helpful AI assistant. Use the conversation history and retrieved context to answer the question.
+
+                            Context from documents:
+                            {context}
+
+                            Conversation History:
+                            {history}
+
+                            Current Question: {question}
+
+                            Answer:"""
+
+        prompt = ChatPromptTemplate.from_template(prompt_template)
+
+        # Step 6: Format the prompt
+        formatted_prompt = prompt.format(
+            context="\n\n".join(contexts),
+            history=history_text,
+            question=query
+        )
+
+        # Step 7: Get response from LLM
+        response = await llm.ainvoke([HumanMessage(content=formatted_prompt)])
+        answer = response.content
+
+        # Step 8: Update memory
+        memory.chat_memory.add_user_message(query)
+        memory.chat_memory.add_ai_message(answer)
+
         return {
             "status": "success",
+            "thread_id": thread_id,
             "query": query,
-            "answer": result,
+            "answer": answer,
+            "contexts_used": len(contexts)
         }
+
     except Exception as e:
-        return {
-            "status": "failed",
-            "error": str(e)
-        }
+        return {"status": "failed", "error": str(e)}
+
+
+@app.get("/rag/clear_memory")
+async def clear_memory(thread_id: str):
+    """Clear conversation memory for a specific thread"""
+    if thread_id in conversation_memories:
+        del conversation_memories[thread_id]
+        return {"status": "success", "message": f"Memory cleared for thread {thread_id}"}
+    else:
+        return {"status": "not_found", "message": f"Thread {thread_id} not found"}
 
 
 if __name__ == "__main__":
